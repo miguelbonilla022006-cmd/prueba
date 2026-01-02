@@ -4,45 +4,23 @@ on: workflow_dispatch
 
 jobs:
   secure-rdp:
-    # --- CAMBIO CLAVE ---
-    # Se cambia de 'windows-latest' (2 cores, sin GPU) a 'windows-latest-4-cores' (4 cores, 1x NVIDIA Tesla T4).
-    # Estos runners son más grandes y tienen un coste mayor por minuto de uso.
-    # Consulta la documentación de GitHub para ver la disponibilidad y el coste en tu plan.
-    runs-on: windows-latest-4-cores
-    
-    # El timeout se mantiene, pero ten en cuenta que el coste por minuto es mayor.
-    timeout-minutes: 360
+    runs-on: self-hosted-gpu
+    timeout-minutes: 3600
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
-          
-          # Remove any existing rule with the same name to avoid duplication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-          
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
-          $charSet = @{
-            Upper = [char[]](65..90) # A-Z
-            Lower = [char[]](97..122) # a-z
-            Number = [char[]](48..57) # 0-9
-            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
+          $charSet = @{ Upper = [char[]](65..90); Lower = [char[]](97..122); Number = [char[]](48..57); Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
           $rawPassword += $charSet.Lower | Get-Random -Count 4
@@ -54,25 +32,6 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          if (-not (Get-LocalUser -Name "RDP")) {
-            Write-Error "User creation failed"
-            exit 1
-          }
-
-      # --- NUEVO PASO AÑADIDO ---
-      # Este paso instala los drivers oficiales de NVIDIA para la GPU Tesla T4.
-      # Es fundamental para que el sistema operativo y las aplicaciones reconozcan la tarjeta.
-      - name: Install NVIDIA Drivers
-        run: |
-          Write-Host "Installing NVIDIA drivers for Tesla T4..."
-          # Descarga el instalador del driver de NVIDIA para Windows Server
-          $driverUrl = "https://us.download.nvidia.com/Windows/537.13/537.13-tesla-desktop-winserver-2019-2022-64bit-international.exe"
-          $installerPath = "$env:TEMP\nvidia_driver.exe"
-          Invoke-WebRequest -Uri $driverUrl -OutFile $installerPath
-          # Instala el driver de forma silenciosa
-          Start-Process -FilePath $installerPath -ArgumentList "/s", "/noreboot" -Wait
-          Write-Host "NVIDIA driver installation completed."
-          Remove-Item $installerPath -Force
 
       - name: Install Tailscale
         run: |
@@ -84,9 +43,7 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-gpu-$env:GITHUB_RUN_ID
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -94,22 +51,13 @@ jobs:
             Start-Sleep -Seconds 5
             $retries++
           }
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned. Exiting."
-            exit 1
-          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP port 3389 failed"
-            exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection to RDP port 3389 failed"; exit 1 }
 
       - name: Maintain Connection and Show GPU Info
         run: |
@@ -118,21 +66,7 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
-          
-          # --- NUEVA VERIFICACIÓN ---
-          # Muestra la información de la GPU para confirmar que está funcionando.
-          # Requiere que el driver de NVIDIA esté instalado (paso anterior).
           Write-Host "`n=== GPU INFORMATION ==="
-          # nvidia-smi es la herramienta estándar de NVIDIA para gestionar la GPU
-          try {
-              & "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-          } catch {
-              Write-Host "nvidia-smi not found. The GPU driver might not be installed correctly or the path is different."
-          }
+          try { & "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe" } catch { Write-Host "nvidia-smi not found." }
           Write-Host "======================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active with GPU - Use Ctrl+C in workflow to terminate"
-            Start-Sleep -Seconds 300
-          }
+          while ($true) { Write-Host "[$(Get-Date)] RDP Active with GPU - Use Ctrl+C in workflow to terminate"; Start-Sleep -Seconds 300 }
